@@ -1,3 +1,4 @@
 .*
 !.gitignore
 dns_dump
+*.o
