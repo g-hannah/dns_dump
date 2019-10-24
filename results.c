@@ -229,6 +229,8 @@ sort_results(DNS_RRECORD *results, int res_cnt, uc *buffer)
 			continue;
 		  }
 	  }
+
+	free(eat);
 	return (0);
 }
 
