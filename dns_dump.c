@@ -65,7 +65,9 @@ dns_dump(char *hostname)
 	memset(&dns_server, 0, sizeof(dns_server));
 	dns_server.sin_port = htons(53);
 	inet_pton(AF_INET, DNS_SERVER, &dns_server.sin_addr.s_addr);
-	dns_socket = socket(AF_INET, SOCK_DGRAM, 0);
+	if ((dns_socket = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+		log_err_quit("Failed to open socket");
+
 	verbose("opened UDP socket on file descriptor %d\n", dns_socket);
 
 	ip4_cnt &= ~ip4_cnt;
