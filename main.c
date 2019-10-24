@@ -259,34 +259,39 @@ int
 host_name_ok(char *host)
 {
 	char		*p = NULL;
+	size_t host_len = strlen(host);
+	char *e = (host + host_len);
 	int			OK, i;
 
 	OK = 1;
 	p = host;
-	while (p < (host + strlen(host)))
-	  {
-		for (i = 0x20; i < 0x41; ++i)
-		  {
+	while (p < e)
+	{
+		if (*p == 0x40)
+		  { OK = 0; goto end; }
+
+		for (i = 0x20; i < 0x30; ++i)
+		{
 			if (*p == 0x2d || *p == 0x2e)
 				continue;
 
 			if (*p == i)
 			  { OK = 0; goto end; }
-		  }
+		}
 
 		for (i = 0x5b; i < 0x61; ++i)
-		  {
+		{
 			if (*p == i)
 			  { OK = 0; goto end; }
-		  }
+		}
 
 		for (i = 0x7b; i < 0x80; ++i)
-		  {
+		{
 			if (*p == i)
 			  { OK = 0; goto end; }
-		  }
+		}
 		++p;
-	  }
+	}
 
 	end:
 	return(OK);
