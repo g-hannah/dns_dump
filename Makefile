@@ -7,10 +7,7 @@ SOURCE_FILES := \
 	dns_dump.c \
 	conversion.c \
 	encode.c \
-	results.c \
 	axfr.c \
-	remove_duplicate_soa_records.c \
-	records.c \
 	misc.c \
 	memory.c \
 	logging.c
