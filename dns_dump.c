@@ -39,6 +39,1023 @@ int			dnskey_cnt;
 int			nsec_cnt;
 int			rrsig_cnt;
 
+static sigjmp_buf			__timeout, __pipe__;
+static struct sigaction		pipe_act, pipe_oact;
+
+static void __dump_axfr_data(char *, char *) __nonnull ((1,2));
+static void __handle_timeout__(int);
+
+void
+free_record(DNS_RRECORD *record)
+{
+	if (record != NULL)
+	  {
+		if (record->name != NULL) { free(record->name); record->name = NULL; }
+		if (record->resource != NULL) { free(record->resource); record->resource = NULL; }
+		if (record->rdata != NULL) { free(record->rdata); record->rdata = NULL; }
+		free(record);
+		record = NULL;
+	  }
+}
+
+void
+free_results_memory(void)
+{
+	int		i;
+
+	if (ip4s != NULL)
+	  {
+		free(ip4s);
+		ip4s = NULL;
+	  }
+
+	if (ip6s != NULL)
+	  {
+		free(ip6s);
+		ip6s = NULL;
+	  }
+
+	if (mx_records != NULL)
+	  {
+		for (i = 0; i < mx_cnt; ++i)
+	  	  {
+			if (mx_records[i].mx_name != NULL) free(mx_records[i].mx_name);
+		  }
+		free(mx_records);
+		mx_records = NULL;
+	  }
+
+	if (soa_records != NULL)
+	  {
+		for (i = 0; i < soa_cnt; ++i)
+		  {
+			if (soa_records[i].domain != NULL) free(soa_records[i].domain);
+			if (soa_records[i].mx_name != NULL) free(soa_records[i].mx_name);
+		  }
+		free(soa_records);
+		soa_records = NULL;
+	  }
+
+	if (name_servers != NULL)
+	  {
+		for (i = 0; i < ns_cnt; ++i)
+		  {
+			if (name_servers[i] != NULL)
+			  {
+				free(name_servers[i]);
+				name_servers[i] = NULL;
+			  }
+		  }
+		free(name_servers);
+		name_servers = NULL;
+	  }
+
+	if (text_records != NULL)
+	  {
+		for (i = 0; i < txt_cnt; ++i)
+		  {
+			if (text_records[i] != NULL)
+			  {
+				free(text_records[i]);
+				text_records[i] = NULL;
+			  }
+		  }
+		free(text_records);
+		text_records = NULL;
+	  }
+
+	if (dnskey_records != NULL)
+	  {
+		for (i = 0; i < dnskey_cnt; ++i)
+		  {
+			if (dnskey_records[i].public_key != NULL)
+			  {
+				free(dnskey_records[i].public_key);
+				dnskey_records[i].public_key = NULL;
+			  }
+		  }
+		free(dnskey_records);
+		dnskey_records = NULL;
+	  }
+
+	if (nsec_records != NULL)
+	  {
+		for (i = 0; i < nsec_cnt; ++i)
+		  {
+			if (nsec_records[i].next_domain != NULL)
+			  {
+				free(nsec_records[i].next_domain);
+				nsec_records[i].next_domain = NULL;	
+			  }
+		  }
+		free(nsec_records);
+		nsec_records = NULL;
+	  }
+
+	if (rrsig_records != NULL)
+	  {
+		for (i = 0; i < rrsig_cnt; ++i)
+		  {
+			if (rrsig_records[i].signer_name != NULL) { free(rrsig_records[i].signer_name); rrsig_records[i].signer_name = NULL; }
+			if (rrsig_records[i].signature != NULL) { free(rrsig_records[i].signature); rrsig_records[i].signature = NULL; }
+		  }
+		free(rrsig_records);
+		rrsig_records = NULL;
+	  }
+}
+
+void
+log_info(char *fmt, ...)
+{
+	va_list		args;
+
+	va_start(args, fmt);
+	vprintf(fmt, args);
+	va_end(args);
+}
+
+void
+verbose(char *fmt, ...)
+{
+	va_list		args;
+
+	if (!VERBOSE)
+		return;
+
+	va_start(args, fmt);
+	vprintf(fmt, args);
+	va_end(args);
+}
+
+void
+log_err(char *fmt, ...)
+{
+	va_list		args;
+	char		*tmp = NULL;
+	int			_errno;
+
+	_errno = errno;
+	posix_memalign((void **)&tmp, 16, MAXLINE);
+
+	va_start(args, fmt);
+	vsprintf(tmp, fmt, args);
+	fprintf(stderr, "%s (%s)\n", tmp, strerror(_errno));
+	va_end(args);
+
+	free(tmp);
+	errno = _errno;
+}
+
+void
+log_err_quit(char *fmt, ...)
+{
+	va_list		args;
+	char		*tmp = NULL;
+	int			_errno;
+
+	_errno = errno;
+	posix_memalign((void **)&tmp, 16, MAXLINE);
+
+	va_start(args, fmt);
+	vsprintf(tmp, fmt, args);
+	fprintf(stderr, "%s (%s)\n", tmp, strerror(_errno));
+	va_end(args);
+
+	free(tmp);
+	errno = _errno;
+	exit(EXIT_FAILURE);
+}
+
+void
+debug(char *fmt, ...)
+{
+	va_list		args;
+
+	if (!DEBUG)
+		return;
+	va_start(args, fmt);
+	printf("\e[38;5;9m[debug] \e[m");
+	vprintf(fmt, args);
+	va_end(args);
+}
+
+void
+__catch_sigpipe(int signo)
+{
+	if (signo != SIGPIPE)
+		return;
+
+	siglongjmp(__pipe__, 1);
+}
+
+void
+__handle_timeout__(int signo)
+{
+	if (signo != SIGALRM)
+		return;
+
+	siglongjmp(__timeout, 1);
+}
+
+int
+get_axfr_record(char *host)
+{
+	DNS_HEADER				*dns_head = NULL;
+	DNS_QUESTION			*dnsq = NULL;
+	struct sockaddr_in		dns_server;
+	int						dns_socket;
+	uc						*buffer = NULL, *p = NULL;
+	char					*primary_ns = NULL;
+	size_t					len;
+	ssize_t					n;
+	char					*primary_inet4 = NULL;
+
+	memset(&alarm_act, 0, sizeof(alarm_act));
+	memset(&alarm_oact, 0, sizeof(alarm_oact));
+	memset(&pipe_act, 0, sizeof(pipe_act));
+	memset(&pipe_oact, 0, sizeof(pipe_oact));
+	pipe_act.sa_handler = __catch_sigpipe;
+	pipe_act.sa_flags = 0;
+	sigemptyset(&pipe_act.sa_mask);
+	sigaction(SIGPIPE, &pipe_act, &pipe_oact);
+
+	alarm_act.sa_handler = __handle_timeout__;
+	alarm_act.sa_flags = 0;
+	sigemptyset(&alarm_act.sa_mask);
+	sigaction(SIGALRM, &alarm_act, &alarm_oact);
+
+	printf("Doing AXFR request\n");
+
+	// get the primary name server's details
+	if (!SERVER)
+	  {
+		printf("Getting primary name server for \"%s\"\n", host);
+		primary_ns = get_primary_ns(host);
+		printf("Got primary name server \"%s\"\n", primary_ns);
+		primary_inet4 = get_inet4_record(primary_ns);
+		strncpy(DNS_SERVER, primary_inet4, strlen(primary_inet4));
+		DNS_SERVER[strlen(primary_inet4)] = 0;
+	  }
+
+	posix_memalign((void **)&buffer, 16, (DNS_BUFSIZE*4));
+	memset(buffer, 0, DNS_BUFSIZE*4);
+	p = buffer;
+
+	dns_head = (DNS_HEADER *)p;
+	dns_head->ident = htons(getpid());
+	dns_head->rd = 1;
+	dns_head->cd = 1;
+	dns_head->qdcnt = htons(1);
+
+	p += sizeof(DNS_HEADER);
+	convert_name(primary_ns, p, &len);
+	p += (len + 1);
+
+	dnsq = (DNS_QUESTION *)p;
+	dnsq->qtype = htons(QTYPE_AXFR);
+	dnsq->qclass = htons(QCLASS_INET);
+	p += sizeof(DNS_QUESTION);
+
+	dns_socket = socket(AF_INET, SOCK_STREAM, 0);
+	memset(&dns_server, 0, sizeof(dns_server));
+	dns_server.sin_port = htons(DNS_PORT);
+	dns_server.sin_family = AF_INET;
+	inet_pton(AF_INET, DNS_SERVER, &dns_server.sin_addr.s_addr);
+
+	printf("Connecting to %s:%hu\n", DNS_SERVER, DNS_PORT);
+	if (sigsetjmp(__timeout, 1) != 0)
+	  {
+		log_err("Request timed out");
+		if (buffer != NULL) { free(buffer); buffer = NULL; }
+		return(1);
+	  }
+
+	alarm(DNS_TIMEOUT);
+	connect(dns_socket, (struct sockaddr *)&dns_server, (socklen_t)sizeof(dns_server));
+	alarm(0);
+	printf("Connected!\n");
+
+	send(dns_socket, buffer, (p - buffer), 0);
+	printf("Sent AXFR request\n");
+
+	if (sigsetjmp(__pipe__, 1) != 0)
+	  {
+		fprintf(stdout,
+			"Caught SIGPIPE (tried to write to socket closed at other end)\n");
+		if (buffer != NULL) { free(buffer); buffer = NULL; }
+		return(SIGPIPE);
+	  }
+
+	alarm(DNS_TIMEOUT);
+	n = recv(dns_socket, buffer, DNS_BUFSIZE*4, 0);
+	alarm(0);
+	if (n == 0)
+	  {
+		fprintf(stdout,
+			"%s @ %s closed TCP socket (refusing connection)\n", primary_ns, primary_inet4);
+		if (buffer != NULL) { free(buffer); buffer = NULL; }
+		return(1);
+	  }
+	else if (n < 0)
+	  {
+		log_err("Error reading from socket!");
+		if (buffer != NULL) { free(buffer); buffer = NULL; }
+		return(-1);
+	  }
+
+	close(dns_socket);
+	printf("Parsing AXFR data\n");
+	parse_axfr_data(buffer, (size_t)n, host, primary_ns);
+	free(buffer);
+	return(0);
+}
+
+void
+parse_axfr_data(uc *data, size_t data_len, char *hostname, char *name_server)
+{
+	DNS_RDATA			*rdata = NULL;
+	int					j;
+	uc					*p = NULL;
+	u16					qtype;
+	char				*eat = NULL; // simply eats unwanted data
+	size_t				delta;
+
+	ip4s = calloc(IP4_ALLOC_SIZE, sizeof(in_addr_t));
+	ip6s = calloc(IP6_ALLOC_SIZE, sizeof(struct in6_addr));
+	mx_records = calloc(MX_ALLOC_SIZE, sizeof(Mx_record));
+	name_servers = calloc(NS_ALLOC_SIZE, sizeof(char *));
+	text_records = calloc(TXT_ALLOC_SIZE, sizeof(char *));
+	dnskey_records = calloc(DNSKEY_ALLOC_SIZE, sizeof(Dnskey_record));
+	nsec_records = calloc(NSEC_ALLOC_SIZE, sizeof(Nsec_record));
+	rrsig_records = calloc(RRSIG_ALLOC_SIZE, sizeof(Rrsig_record));
+
+	for (j = 0; j < NS_ALLOC_SIZE; ++j)
+		name_servers[j] = NULL;
+	for (j = 0; j < TXT_ALLOC_SIZE; ++j)
+		text_records[j] = NULL;
+
+	eat = calloc(host_max, sizeof(char));
+
+	p = data;
+	while (p < (data + data_len))
+	  {
+		get_name(data, p, (uc *)eat, &delta);
+		p += delta;
+		rdata = (DNS_RDATA *)p;
+		qtype = htons(rdata->type);
+		p += sizeof(DNS_RDATA);
+
+		// AT THIS POINT P IS ALREADY POINTING TO THE START OF THE RR DATA
+		switch(qtype)
+		  {
+			case(QTYPE_A):
+			++ip4_cnt;
+			if (ip4_cnt >= IP4_ALLOC_SIZE)
+			  {
+				IP4_ALLOC_SIZE *= 2;
+				ip4s = realloc(ip4s, (sizeof(in_addr_t) * IP4_ALLOC_SIZE));
+			  }
+			ip4s[(ip4_cnt-1)] = *((in_addr_t *)p);
+			p += sizeof(in_addr_t);
+			break;
+			case(QTYPE_NS):
+			++ns_cnt;
+			if (ns_cnt >= NS_ALLOC_SIZE)
+			  {
+				NS_ALLOC_SIZE *= 2;
+				name_servers = realloc(name_servers, (sizeof(char *) * NS_ALLOC_SIZE));
+				for (j = ns_cnt-1; j < NS_ALLOC_SIZE; ++j)
+					name_servers[j] = NULL;
+			  }
+			name_servers[(ns_cnt-1)] = calloc(host_max, sizeof(char));
+			get_name(data, p, (uc *)name_servers[(ns_cnt-1)], &delta);
+			p += delta;
+			break;
+			case(QTYPE_MX):
+			++mx_cnt;
+			if (mx_cnt >= MX_ALLOC_SIZE)
+			  {
+				MX_ALLOC_SIZE *= 2;
+				mx_records = realloc(mx_records, (sizeof(Mx_record) * MX_ALLOC_SIZE));
+			  }
+
+			mx_records[(mx_cnt-1)].preference = ntohs((*(u16 *)p));
+			mx_records[(mx_cnt-1)].mx_name = calloc(host_max, sizeof(char));
+			p += sizeof(u16);
+			get_name(data, p, mx_records[(mx_cnt-1)].mx_name, &delta);
+			p += delta;
+			break;
+			case(QTYPE_TXT):
+			++txt_cnt;
+			if (txt_cnt >= TXT_ALLOC_SIZE)
+			  {
+				TXT_ALLOC_SIZE *= 2;
+				text_records = realloc(text_records, (sizeof(char *) * TXT_ALLOC_SIZE));
+			  }
+			for (j = txt_cnt-1; j < TXT_ALLOC_SIZE; ++j)
+				text_records[j] = NULL;
+			text_records[(txt_cnt-1)] = calloc(ntohs(rdata->len), sizeof(char *));
+			memcpy(text_records[(txt_cnt-1)], p, ntohs(rdata->len));
+			break;
+			case(QTYPE_AAAA):
+			++ip6_cnt;
+			if (ip6_cnt >= IP6_ALLOC_SIZE)
+			  {
+				IP6_ALLOC_SIZE *= 2;
+				ip6s = realloc(ip6s, (sizeof(struct in6_addr) * IP6_ALLOC_SIZE));
+			  }
+			memcpy(&ip6s[(ip6_cnt-1)], p, sizeof(struct in6_addr));
+			p += sizeof(struct in6_addr);
+			break;
+			default:
+			// just pass by whatever it is
+			p += ntohs(rdata->len);
+		  }
+	  }
+
+	free(eat);
+	__dump_axfr_data(hostname, name_server);
+	free_results_memory();
+}
+
+void
+__dump_axfr_data(char *host, char *ns)
+{
+	FILE		*fp = NULL;
+	int			i, fd;
+	char		*tmp = NULL;
+	Inet_u		inet_u;
+	size_t		len;
+
+	if (TO_FILE)
+	  {
+		check_dump_directory();
+		tmp = calloc(MAXLINE, sizeof(char));
+		sprintf(tmp, "%s/DNS_dumps/%s_axfr_data.txt", HOME_DIR, host);
+		fd = open(tmp, O_RDWR|O_CREAT|O_TRUNC, S_IRWXU & ~S_IXUSR);
+		fp = fdopen(fd, "r+");
+		free(tmp);
+		tmp = NULL;
+	  }
+
+	memset(&inet_u, 0, sizeof(inet_u));
+	len = 0;
+
+	fprintf((TO_FILE?fp:stdout),
+		"\n"
+		"\t\tAXFR Dump for host \"%s\" with primary NS \"%s\", on %s\n"
+		"\n",
+		host, ns, get_time_string(NULL));
+		
+	fprintf((TO_FILE?fp:stdout), "\t\t\t\tIPv4s\n");
+	for (i = 0; i < ip4_cnt; ++i)
+	  {
+		fprintf((TO_FILE?fp:stdout),
+			"\t\t\t%*.*s => %s\n",
+			(int)INET_ADDRSTRLEN, (int)INET_ADDRSTRLEN,
+			inet_ntop(AF_INET, &ip4s[i], (char *)inet_u.inet4, INET_ADDRSTRLEN),
+			(char *)get_inet4_ptr_record(ip4s[i]));
+	  }
+
+	fprintf((TO_FILE?fp:stdout), "\t\t\t\tIPv6s\n");
+	for (i = 0; i < ip6_cnt; ++i)
+	  {
+		fprintf((TO_FILE?fp:stdout),
+			"\t\t\t%*.*s => %s\n",
+			(int)INET6_ADDRSTRLEN, (int)INET6_ADDRSTRLEN,
+			inet_ntop(AF_INET6, &ip6s[i], (char *)inet_u.inet6, INET6_ADDRSTRLEN),
+			(char *)get_inet6_ptr_record(ip6s[i]));
+	  }
+
+	len = 0;
+	for (i = 0; i < mx_cnt; ++i)
+		if (strlen((char *)mx_records[i].mx_name) > len)
+			len = strlen((char *)mx_records[i].mx_name);
+
+	fprintf((TO_FILE?fp:stdout), "\t\t\t\tMail Exchanges\n");
+	for (i = 0; i < mx_cnt; ++i)
+	  {
+		fprintf((TO_FILE?fp:stdout),
+			"\t\t\t%*.*s (%hu)\n",
+			(int)len, (int)len,
+			(char *)mx_records[i].mx_name,
+			mx_records[i].preference);
+	  }
+
+	len = 0;
+	for (i = 0; i < ns_cnt; ++i)
+		if (strlen((char *)name_servers[i]) > len)
+			len = strlen((char *)name_servers[i]);
+
+	fprintf((TO_FILE?fp:stdout), "\t\t\t\tName Servers\n");
+	for (i = 0; i < ns_cnt; ++i)
+	  {
+		fprintf((TO_FILE?fp:stdout),
+			"\t\t\t%*.*s => %s\n",
+			(int)len, (int)len,
+			name_servers[i],
+			get_inet4_record(name_servers[i]));
+	  }
+}
+
+uc *
+convert_name(char *name, uc *caller_buf, size_t *len)
+{
+	uc 		*p = NULL, *q = NULL;
+	size_t	l;
+
+	sprintf((char *)caller_buf, ".%s.", (char *)name);
+	q = caller_buf;
+	l = strlen((char *)caller_buf);
+
+	while (1)
+	  {
+		p = q;
+		if (q == (caller_buf + (l - 1)))
+			break;
+		++q;
+		while (*q != 0x2e && q < (caller_buf + l))
+			++q;
+		*p = ((q - p)-1);
+	  }
+
+	debug("caller buf is @ %p: pointer 'q' is @ %p\n", caller_buf, q);
+	*q = 0;
+	*len = (q - caller_buf);
+ 
+	return(caller_buf);
+}
+
+uc *
+convert_inet4_to_ptr(uc *inet4_str, uc *caller_buf, size_t *len)
+{
+	in_addr_t		inet4_addr;
+	uc				*p = NULL, *q = NULL;
+	size_t			l;
+	Inet_u			inet_u;
+
+	inet_pton(AF_INET, (char *)inet4_str, &inet4_addr);
+	inet4_addr = htonl(inet4_addr);
+	memset(&inet_u, 0, sizeof(inet_u));
+	inet_ntop(AF_INET, &inet4_addr, (char *)inet_u.inet4, INET_ADDRSTRLEN);
+	sprintf((char *)caller_buf, ".%s.in-addr.arpa.", (char *)inet_u.inet4);
+
+	q = caller_buf;
+	l = strlen((char *)caller_buf);
+
+	while (1)
+	  {
+		p = q;
+		if (q == (caller_buf + (l - 1)))
+			break;
+		++q;
+		while (*q != 0x2e && q < (caller_buf + l))
+			++q;
+		*p = ((q - p)-1);
+	  }
+
+	debug("caller buf is @ %p: pointer 'q' is @ %p\n", caller_buf, q);
+	*q = 0;
+	*len = (q - caller_buf);
+
+	return(caller_buf);
+}
+
+uc *
+convert_inet6_to_ptr(uc *inet6_str, uc *caller_buf, size_t *len)
+{
+	uc					*tmp = NULL, *t = NULL, *p = NULL, *q = NULL;
+	int					i;
+	struct in6_addr		inet6_addr;
+	size_t				l;
+	char				c;
+
+	inet_pton(AF_INET6, (char *)inet6_str, &inet6_addr);
+	posix_memalign((void **)&tmp, 16, host_max);
+	t = tmp;
+	for (i = 15; i >= 0; --i)
+	  {
+		c = (inet6_addr.s6_addr[i] & 0x0f);
+		if (c < 0x0a)
+			c += 0x30;
+		else
+			c += 0x57;
+		*t++ = c;
+		*t++ = 0x2e;
+
+		c = ((inet6_addr.s6_addr[i] >> 4) & 0x0f);
+		if (c < 0x0a)
+			c += 0x30;
+		else
+			c += 0x57;
+
+		*t++ = c;
+		if (i != 0)
+			*t++ = 0x2e;
+	  }
+
+	*t = 0;
+
+	sprintf((char *)caller_buf, ".%s.ip6.arpa.", (char *)tmp);
+	l = strlen((char *)caller_buf);
+
+	q = caller_buf;
+
+	while (1)
+	  {
+		p = q;
+		if (q == (caller_buf + (l - 1)))
+			break;
+		++q;
+		while (*q != 0x2e && q < (caller_buf + l))
+			++q;
+		*p = ((q - p)-1);
+	  }
+
+	*q = 0;
+	*len = (q - caller_buf);
+
+	return(caller_buf);
+}
+
+char *
+get_time_string(time_t *time_val)
+{
+	struct tm			*TIME = NULL;
+
+	if (time_val == NULL)
+	  {
+		time_t		now;
+
+		time(&now);
+		TIME = gmtime(&now);
+	  }
+	else
+	  {
+		TIME = gmtime(time_val);
+	  }
+
+	memset(time_string, 0, 64);
+	strftime(time_string, 64, "%a, %d %b %Y %H:%M:%S", TIME);
+	return(time_string);
+}
+
+void
+check_dump_directory(void)
+{
+	char		*buf = NULL;
+
+	buf = calloc(path_max, sizeof(char));
+	sprintf(buf, "%s/DNS_dumps", HOME_DIR);
+
+	if (access(buf, F_OK) != 0)
+	  {
+		mkdir(buf, S_IRWXU);
+	  }
+
+	if (buf != NULL) free(buf);
+	return;
+}
+
+char *
+stringify_rcode(u16 rcode)
+{
+	switch(rcode)
+	  {
+		case(RCODE_FMT):
+		return("Format Error");
+		break;
+		case(RCODE_SRV):
+		return("Server Error");
+		break;
+		case(RCODE_NAM):
+		return("Domain Name Non-Existant");
+		break;
+		case(RCODE_IMP):
+		return("Not Implemented");
+		break;
+		case(RCODE_REF):
+		return("Query Refused");
+		break;
+		default:
+		return("Successful");
+	  }
+}
+
+char *
+stringify_qtype(u16 qtype)
+{
+	switch(qtype)
+	  {
+		case(QTYPE_A):
+		return("A");
+		break;
+		case(QTYPE_NS):
+		return("NS");
+		break;
+		case(QTYPE_CNAME):
+		return("CNAME");
+		break;
+		case(QTYPE_SOA):
+		return("SOA");
+		break;
+		case(QTYPE_PTR):
+		return("PTR");
+		break;
+		case(QTYPE_MX):
+		return("MX");
+		break;
+		case(QTYPE_TXT):
+		return("TXT");
+		break;
+		case(QTYPE_RP):
+		return("RP");
+		break;
+		case(QTYPE_AFSDB):
+		return("AFSDB");
+		break;
+		case(QTYPE_SIG):
+		return("SIG");
+		break;
+		case(QTYPE_KEY):
+		return("KEY");
+		break;
+		case(QTYPE_AAAA):
+		return("AAAA");
+		break;
+		case(QTYPE_LOC):
+		return("LOC");
+		break;
+		case(QTYPE_SRV):
+		return("SRV");
+		break;
+		case(QTYPE_NAPTR):
+		return("NAPTR");
+		break;
+		case(QTYPE_KX):
+		return("KX");
+		break;
+		case(QTYPE_CERT):
+		return("CERT");
+		break;
+		case(QTYPE_DNAME):
+		return("DNAME");
+		break;
+		case(QTYPE_OPT):
+		return("OPT");
+		break;
+		case(QTYPE_APL):
+		return("APL");
+		break;
+		case(QTYPE_DS):
+		return("DS");
+		break;
+		case(QTYPE_SSHFP):
+		return("SSHFP");
+		break;
+		case(QTYPE_IPSECKEY):
+		return("IPSECKEY");
+		break;
+		case(QTYPE_RRSIG):
+		return("RRSIG");
+		break;
+		case(QTYPE_NSEC):
+		return("NSEC");
+		break;
+		case(QTYPE_DNSKEY):
+		return("DNSKEY");
+		break;
+		case(QTYPE_DHCID):
+		return("DHCID");
+		break;
+		case(QTYPE_NSEC3):
+		return("NSEC3");
+		break;
+		case(QTYPE_NSEC3PARAM):
+		return("NSEC3PARAM");
+		break;
+		case(QTYPE_TLSA):
+		return("TLSA");
+		break;
+		case(QTYPE_HIP):
+		return("HIP");
+		break;
+		case(QTYPE_CDS):
+		return("CDS");
+		break;
+		case(QTYPE_CDNSKEY):
+		return("CDNSKEY");
+		break;
+		case(QTYPE_OPENPGPKEY):
+		return("OPENPGPKEY");
+		break;
+		case(QTYPE_TKEY):
+		return("TKEY");
+		break;
+		case(QTYPE_TSIG):
+		return("TSIG");
+		break;
+		case(QTYPE_IXFR):
+		return("IXFR");
+		break;
+		case(QTYPE_AXFR):
+		return("AXFR");
+		break;
+		case(QTYPE_URI):
+		return("URI");
+		break;
+		case(QTYPE_TA):
+		return("TA");
+		break;
+		case(QTYPE_DLV):
+		return("DLV");
+		break;
+		default:
+		return(NULL);
+	  }
+}
+
+char *
+stringify_dnskey_algo(uc algo)
+{
+	switch(algo)
+	  {
+		case(1):
+		return("RSA/MD5");
+		break;
+		case(2):
+		return("Diffie-Hellman");
+		break;
+		case(3):
+		return("DSA/SHA-1");
+		break;
+		case(4):
+		return("Elliptic Curve");
+		break;
+		case(5):
+		return("RSA/SHA-1");
+		break;
+		case(252):
+		return("Indirect");
+		break;
+		case(253):
+		return("Private (PRIVATEDNS)");
+		break;
+		case(254):
+		return("Private (PRIVATEOID)");
+		break;
+		default:
+		return("Unknown");
+	  }
+	return(NULL);
+}
+
+char *
+stringify_qclass(u16 qclass)
+{
+	return(NULL);
+}
+
+void
+bit_print_fp(uc *data, FILE *stream, size_t len)
+{
+	uc			TOP_BIT = 0x80;
+	int			bit, i;
+
+	for (i = 0; i < len; ++i)
+	  {
+		for (bit = 0; bit < 8; ++bit)
+	  	  {
+			if ((data[i] << bit) & TOP_BIT)
+				fputc(0x31, stream);
+			else
+				fputc(0x30, stream);
+	  	  }
+	  }	
+}
+
+char *
+b64encode_r(uc *data, uc *out, size_t len, size_t *nlen)
+{
+	size_t		l;
+	int		i, j;
+
+	if (len <= 0)
+		l = strlen((char *)data);
+	else
+		l = len;
+
+	j &= ~j; i &= ~i;
+
+	if (l == 1)
+	  {
+		out[j++] |= ((data[i] >> 2) & 0x3f);
+		out[j++] |= ((data[i] << 4) & 0x30);
+		out[j++] = 0x40;
+		out[j++] = 0x40;
+		out[j] = 0; *nlen = (size_t)j;
+		for (i = 0; i < j; ++i)
+			out[i] = b64table[(int)(out[i])];
+		return((char *)out);
+	  }
+	else if (l == 2)
+	  {
+		out[j++] |= ((data[i] >> 2) & 0x3f);
+		out[j] |= ((data[i] << 4) & 0x30);
+		++i; --l;
+		out[j++] |= ((data[i] >> 4) & 0x0f);
+		out[j++] |= ((data[i] << 2) & 0x3c);
+		++i; --l;
+		out[j++] = 0x40;
+		out[j] = 0; *nlen = (size_t)j;
+		for (i = 0; i < j; ++i)
+			out[i] = b64table[(int)(out[i])];
+		return((char *)out);
+	  }
+	else
+	  {
+		while (l > 0)
+	  	  {
+			out[j++] |= ((data[i] >> 2) & 0x3f);
+			out[j] |= ((data[i] << 4) & 0x30);
+			++i; --l;
+			out[j++] |= ((data[i] >> 4) & 0x0f);
+			out[j] |= ((data[i] << 2) & 0x3c);
+			++i; --l;
+			out[j++] |= ((data[i] >> 6) & 0x03);
+			out[j++] |= (data[i] & 0x3f);
+			++i; --l;
+
+			if (l == 1)
+		  	  {
+				out[j++] |= ((data[i] >> 2) & 0x3f);
+				out[j++] |= ((data[i] << 4) & 0x30);
+				--l;
+				out[j++] = 0x40;
+				out[j++] = 0x40;
+				out[j] = 0; *nlen = (size_t)j;
+				break;
+		  	  }
+			else if (l == 2)
+		  	  {
+				out[j++] |= ((data[i] >> 2) & 0x3f);
+				out[j] |= ((data[i] << 4) & 0x30);
+				++i; --l;
+				out[j++] |= ((data[i] >> 4) & 0x0f);
+				out[j++] |= ((data[i] << 2) & 0x3c);
+				out[j++] = 0x40;
+				out[j] = 0; *nlen = (size_t)j;
+				break;
+		  	  }
+	  	  }
+		for (i = 0; i < j; ++i)
+			out[i] = b64table[(int)(out[i])];
+		return((char *)out);
+  	  }
+}
+
+uc *
+b64decode_r(char *data, uc *out, size_t len, size_t *nlen)
+{
+	size_t			l;
+	int			i, j;
+
+	if (len <= 0)
+		l = len;
+	else
+		l = strlen(data);
+
+	i &= ~i; j &= ~j;
+
+	for (i = 0; i < l; ++i)
+	  {
+		j &= ~j;
+		while (b64table[j] != data[i])
+			++j;
+		data[i] = j;
+	  }
+
+	i &= ~i; j &= ~j;
+	while (l > 0)
+	  {
+		out[j] |= ((data[i++] << 2) & 0xfc);
+		--l;
+		out[j++] |= ((data[i] >> 4) & 0x03);
+		out[j] |= ((data[i++] << 4) & 0xf0);
+		--l;
+		out[j++] |= ((data[i] >> 2) & 0x0f);
+		out[j] |= ((data[i++] << 6) & 0xc0);
+		--l;
+		out[j++] |= (data[i++] & 0x3f);
+		--l;
+	  }
+
+	out[j] = 0;
+	*nlen = (size_t)j;
+
+	return(out);
+}
+
 #define SOA_DUP			1
 #define SOA_OK			0
 #define SOA_ERR			-1

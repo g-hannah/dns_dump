@@ -4,13 +4,7 @@ LIBS=-lcrypto
 
 SOURCE_FILES := \
 	main.c \
-	dns_dump.c \
-	conversion.c \
-	encode.c \
-	axfr.c \
-	misc.c \
-	memory.c \
-	logging.c
+	dns_dump.c
 
 OBJECT_FILES := ${SOURCE_FILES:.c=.o}
 
